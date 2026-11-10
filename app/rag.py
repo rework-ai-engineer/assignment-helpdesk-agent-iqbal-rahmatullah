@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 load_dotenv()
 
@@ -23,7 +23,14 @@ EMBED_MODEL = "gemini-embedding-001"
 GEN_MODEL = "gemini-3.6-flash"
 DIMENSI = 768
 
-_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+_client = genai.Client(
+    api_key=os.environ.get("GEMINI_API_KEY"),
+    http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=3)),
+)
+
+
+class LLMError(Exception):
+    pass
 
 KNOWLEDGE_BASE_PATH = "data/it_helpdesk_knowledge_base.csv"
 
@@ -89,14 +96,21 @@ Jawab pertanyaan karyawan berdasarkan Context di bawah ini, dan hanya dari Conte
 
 
 async def answer_from_knowledge_base(query: str) -> str:
-    hits = await asyncio.to_thread(semantic_search, query)
-    if not hits or hits[0]["score"] < MIN_SCORE:
-        return NOT_FOUND
-    resp = await _client.aio.models.generate_content(
-        model=GEN_MODEL,
-        contents=_build_prompt(query, hits),
-        config=types.GenerateContentConfig(system_instruction=PERSONA, temperature=0.2),
-    )
+    try:
+        hits = await asyncio.to_thread(semantic_search, query)
+        if not hits or hits[0]["score"] < MIN_SCORE:
+            return NOT_FOUND
+        resp = await _client.aio.models.generate_content(
+            model=GEN_MODEL,
+            contents=_build_prompt(query, hits),
+            config=types.GenerateContentConfig(
+                system_instruction=PERSONA,
+                temperature=0.2,
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            ),
+        )
+    except errors.APIError as e:
+        raise LLMError(f"Gemini API gagal: {e.code} {e.status}") from e
     if not resp.text:
-        raise RuntimeError("LLM mengembalikan respons kosong")
+        raise LLMError("LLM mengembalikan respons kosong")
     return resp.text.strip()

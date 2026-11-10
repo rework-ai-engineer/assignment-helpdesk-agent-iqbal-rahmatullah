@@ -8,22 +8,39 @@ Alur endpoint utama:
   4. Mengembalikan response terstruktur ke client
 """
 
-from fastapi import FastAPI
-from pydantic import BaseModel
+import logging
 
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.rag import LLMError
 from app.router import handle_query
+
+logger = logging.getLogger("helpdesk")
 
 app = FastAPI(title="IT Helpdesk Assistant API")
 
 
 class AskRequest(BaseModel):
-    query: str
+    model_config = ConfigDict(str_strip_whitespace=True)
+    query: str = Field(min_length=1, max_length=500)
 
 
 class AskResponse(BaseModel):
     status: str
     intent: str
     data: str
+
+
+def _error(code: int, intent: str, data: str) -> JSONResponse:
+    return JSONResponse(status_code=code, content={"status": "error", "intent": intent, "data": data})
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    return _error(422, "unknown", "Request tidak valid: 'query' wajib diisi (1-500 karakter).")
 
 
 @app.get("/health")
@@ -34,13 +51,11 @@ async def health():
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest):
-    """
-    Endpoint utama. Menerima pertanyaan bebas dari user (bisa berupa
-    pertanyaan informasi/kebijakan ATAU permintaan cek status tiket),
-    lalu meneruskannya ke router untuk diproses.
-
-    # TODO: tambahkan error handling untuk kondisi LLM gagal merespons
-    # atau intent tidak dapat dikenali (lihat panduan error handling di Sesi 13.4)
-    """
-    result = await handle_query(request.query)
-    return AskResponse(**result)
+    try:
+        return AskResponse(**await handle_query(request.query))
+    except LLMError:
+        logger.exception("LLM gagal merespons")
+        return _error(503, "faq", "Layanan AI sedang tidak tersedia. Silakan coba lagi beberapa saat.")
+    except Exception:
+        logger.exception("Error tak terduga di /ask")
+        return _error(500, "unknown", "Terjadi kesalahan internal pada server.")
