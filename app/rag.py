@@ -7,57 +7,96 @@ LLM Application) dan Sesi 11 (Building a Simple RAG System) — di assignment in
 alur tersebut dibungkus menjadi fungsi yang dipanggil oleh router.py.
 """
 
+import asyncio
 import os
-import pandas as pd
-import numpy as np
+
 import faiss
-from google import genai  # sesuaikan dengan library Gemini API yang digunakan
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
+
+EMBED_MODEL = "gemini-embedding-001"
+GEN_MODEL = "gemini-3.6-flash"
+DIMENSI = 768
 
 _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 KNOWLEDGE_BASE_PATH = "data/it_helpdesk_knowledge_base.csv"
 
-# 🔧 TODO: muat knowledge base dan bangun index FAISS saat aplikasi startup
-# (bukan di setiap request), agar lebih efisien. Pertimbangkan menggunakan
-# FastAPI startup event atau lazy-loading dengan cache sederhana.
-
 _index = None
-_documents = None
 _df = None
 
+NOT_FOUND = "Maaf, saya tidak menemukan informasi tersebut di knowledge base. Silakan hubungi tim IT atau HR."
+MIN_SCORE = 0.65
 
-def _get_embedding(text: str):
-    result = _client.models.embed_content(
-        model="text-embedding-004",  # sesuaikan versi model embedding
-        contents=text,
+PERSONA = "Kamu adalah asisten IT Helpdesk internal perusahaan. Gaya bicaramu ramah, ringkas, dan akurat."
+
+
+def _embed(texts: list[str], task_type: str) -> np.ndarray:
+    resp = _client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=DIMENSI),
     )
-    return result.embeddings[0].values
+    vec = np.array([e.values for e in resp.embeddings], dtype="float32")
+    faiss.normalize_L2(vec)
+    return vec
 
 
 def build_index():
-    """
-    # TODO: implementasikan pembangunan index FAISS dari knowledge base CSV.
-    # Referensi: starter_notebook_semantic_search.ipynb dari Assignment 3,
-    # Section 1-4 (load data -> unit retrievable -> embedding -> simpan ke FAISS).
-    """
-    raise NotImplementedError("Implementasikan build_index di sini")
+    global _index, _df
+    df = pd.read_csv(KNOWLEDGE_BASE_PATH)
+    teks = (df["category"] + "\nQ: " + df["question"] + "\nA: " + df["answer"]).tolist()
+    vec = _embed(teks, "RETRIEVAL_DOCUMENT")
+    index = faiss.IndexFlatIP(DIMENSI) 
+    index.add(vec)
+    _df, _index = df, index
 
 
-def semantic_search(query: str, top_k: int = 3):
-    """
-    # TODO: implementasikan semantic search terhadap index yang sudah dibangun.
-    # Referensi: starter_notebook_semantic_search.ipynb, Section 5.
-    """
-    raise NotImplementedError("Implementasikan semantic_search di sini")
+def semantic_search(query: str, top_k: int = 3) -> list[dict]:
+    if _index is None:
+        build_index()
+    skor, baris = _index.search(_embed([query], "RETRIEVAL_QUERY"), top_k)
+    hasil = []
+    for s, i in zip(skor[0], baris[0]):
+        r = _df.iloc[i]
+        hasil.append(
+            {"faq_id": int(r.faq_id), "category": r.category, "question": r.question,
+             "answer": r.answer, "score": float(s)}
+        )
+    return hasil
+
+
+def _build_prompt(query: str, hits: list[dict]) -> str:
+    context = "\n\n".join(f"[FAQ {h['faq_id']}] {h['question']}\n{h['answer']}" for h in hits)
+    return f"""# Task
+Jawab pertanyaan karyawan berdasarkan Context di bawah ini, dan hanya dari Context itu.
+
+# Context
+{context}
+
+# Format
+- Bahasa Indonesia, maksimal 3 kalimat, langsung ke inti.
+- Jangan menambah fakta, angka, atau prosedur yang tidak ada di Context.
+- Jika Context tidak memuat jawabannya, jawab persis: "{NOT_FOUND}"
+
+# Pertanyaan
+{query}"""
 
 
 async def answer_from_knowledge_base(query: str) -> str:
-    """
-    Fungsi yang dipanggil router.py ketika intent = 'faq'.
-    Menjalankan semantic search, menyusun prompt dengan context hasil retrieval,
-    lalu memanggil LLM untuk menghasilkan jawaban.
-
-    # TODO: implementasikan alur lengkap: semantic_search -> build prompt
-    # (Persona/Task/Context/Format, lihat Assignment 3 Section 6) -> panggil LLM.
-    """
-    raise NotImplementedError("Implementasikan answer_from_knowledge_base di sini")
+    hits = await asyncio.to_thread(semantic_search, query)
+    if not hits or hits[0]["score"] < MIN_SCORE:
+        return NOT_FOUND
+    resp = await _client.aio.models.generate_content(
+        model=GEN_MODEL,
+        contents=_build_prompt(query, hits),
+        config=types.GenerateContentConfig(system_instruction=PERSONA, temperature=0.2),
+    )
+    if not resp.text:
+        raise RuntimeError("LLM mengembalikan respons kosong")
+    return resp.text.strip()
