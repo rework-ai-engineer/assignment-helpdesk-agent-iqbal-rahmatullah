@@ -20,7 +20,7 @@ from google.genai import errors, types
 load_dotenv()
 
 EMBED_MODEL = "gemini-embedding-001"
-GEN_MODEL = "gemini-3.6-flash"
+GEN_MODEL = "gemini-3.5-flash-lite"
 DIMENSI = 768
 
 _client = genai.Client(
@@ -103,11 +103,7 @@ async def answer_from_knowledge_base(query: str) -> str:
         resp = await _client.aio.models.generate_content(
             model=GEN_MODEL,
             contents=_build_prompt(query, hits),
-            config=types.GenerateContentConfig(
-                system_instruction=PERSONA,
-                temperature=0.2,
-                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-            ),
+            config=types.GenerateContentConfig(system_instruction=PERSONA, temperature=0.2),
         )
     except errors.APIError as e:
         raise LLMError(f"Gemini API gagal: {e.code} {e.status}") from e
